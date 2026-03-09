@@ -97,7 +97,7 @@ export default function FileUpload({ onUpload }: FileUploadProps) {
       </div>
 
       <div className="mt-2 rounded-full bg-gray-800 px-4 py-1.5 text-xs text-gray-400">
-        Supports Airwallex bank statements (.pdf)
+        Supports any bank statement PDF
       </div>
     </div>
   );

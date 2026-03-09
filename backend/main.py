@@ -15,7 +15,9 @@ from sse_starlette.sse import EventSourceResponse
 
 from pdf_processor import (
     calculate_summary,
+    detect_format,
     extract_page_transactions,
+    extract_text_transactions,
     validate_balances,
     write_csv,
 )
@@ -64,36 +66,42 @@ async def process_pdf_job(job_id: str):
         await q.put(step_event(f"Found {total_pages} pages in the PDF"))
         await asyncio.sleep(0)
 
-        await q.put(step_event("Beginning table extraction from each page..."))
+        # Detect PDF format
+        await q.put(step_event("Detecting statement format..."))
+        await asyncio.sleep(0)
+        fmt = detect_format(pdf)
+        await q.put(step_event(f"Detected format: {'table-based' if fmt == 'table' else 'text-based'} statement"))
         await asyncio.sleep(0)
 
         all_transactions = []
-        pages_with_data = 0
 
-        for i in range(total_pages):
-            # Open and process one page at a time to minimize memory
-            page = pdf.pages[i]
-            txns = extract_page_transactions(page)
+        if fmt == "table":
+            await q.put(step_event("Beginning table extraction from each page..."))
+            await asyncio.sleep(0)
 
-            if txns:
-                pages_with_data += 1
-                all_transactions.extend(txns)
+            for i in range(total_pages):
+                page = pdf.pages[i]
+                txns = extract_page_transactions(page)
+                if txns:
+                    all_transactions.extend(txns)
+                page.flush_cache()
 
-            # Flush page from cache to free memory
-            page.flush_cache()
+                if (i + 1) % 50 == 0:
+                    gc.collect()
 
-            # Force garbage collection every 50 pages
-            if (i + 1) % 50 == 0:
-                gc.collect()
-
-            # Send progress every 10 pages or on first/last page
-            if i == 0 or i == total_pages - 1 or (i + 1) % 10 == 0:
-                await q.put(progress_event(
-                    f"Processing page {i + 1}/{total_pages} — {len(all_transactions)} transactions found so far",
-                    i + 1,
-                    total_pages,
-                ))
-                await asyncio.sleep(0)
+                if i == 0 or i == total_pages - 1 or (i + 1) % 10 == 0:
+                    await q.put(progress_event(
+                        f"Processing page {i + 1}/{total_pages} — {len(all_transactions)} transactions found so far",
+                        i + 1,
+                        total_pages,
+                    ))
+                    await asyncio.sleep(0)
+        else:
+            await q.put(step_event("Extracting transactions from text content..."))
+            await asyncio.sleep(0)
+            all_transactions = extract_text_transactions(pdf)
+            await q.put(step_event(f"Found {len(all_transactions)} entries from text parsing"))
+            await asyncio.sleep(0)
 
         pdf.close()
         gc.collect()
