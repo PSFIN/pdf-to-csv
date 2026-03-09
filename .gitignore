@@ -1,0 +1,18 @@
+# Dependencies
+frontend/node_modules/
+frontend/.next/
+
+# Python
+backend/__pycache__/
+backend/*.pyc
+
+# Uploads (runtime data)
+backend/uploads/
+
+# Environment
+.env
+.env.local
+frontend/.env.local
+
+# OS
+.DS_Store
