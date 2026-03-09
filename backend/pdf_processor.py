@@ -149,17 +149,189 @@ def parse_date_text(raw: str, year_hint: str = "") -> str:
     return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
 
 
+def detect_text_format(all_text: str) -> str:
+    """Detect which text-based format this is."""
+    lower = all_text.lower()
+    # OCBC style: "DD MON DD MON Description amounts"
+    if "balance b/f" in lower or "balance c/f" in lower:
+        return "ocbc"
+    # Bank of America style: sections with "Deposits and other credits"
+    if "deposits and other credits" in lower or "withdrawals and other debits" in lower:
+        return "boa"
+    # Generic: try to find MM/DD/YY patterns
+    if re.search(r"\d{2}/\d{2}/\d{2,4}", all_text):
+        return "generic"
+    return "generic"
+
+
 def extract_text_transactions(pdf) -> list[Transaction]:
-    """Extract transactions from text-based PDFs (e.g., Bank of America)."""
+    """Extract transactions from text-based PDFs."""
     all_text = ""
     for page in pdf.pages:
         text = page.extract_text()
         if text:
             all_text += text + "\n"
 
+    text_fmt = detect_text_format(all_text)
+
+    if text_fmt == "ocbc":
+        return extract_ocbc_transactions(all_text)
+    elif text_fmt == "boa":
+        return extract_boa_transactions(all_text)
+    else:
+        return extract_generic_text_transactions(all_text)
+
+
+# ---------------------------------------------------------------------------
+# OCBC Bank format: "DD MON DD MON Description  Withdrawal Deposit Balance"
+# ---------------------------------------------------------------------------
+
+# Matches: 02 JUL 02 JUL PAYMENT/TRANSFER 3,200.00 3,060.00
+OCBC_TXN_PATTERN = re.compile(
+    r"^(\d{2}\s+[A-Z]{3})\s+(\d{2}\s+[A-Z]{3})\s+(.+)"
+)
+
+# Matches: BALANCE B/F 140.00DR  or  BALANCE B/F 140.00
+OCBC_BALANCE_BF = re.compile(
+    r"BALANCE\s+B/F\s+([\d,]+\.\d{2})\s*(DR|CR)?\s*$", re.IGNORECASE
+)
+OCBC_BALANCE_CF = re.compile(
+    r"BALANCE\s+C/F\s+([\d,]+\.\d{2})\s*(DR|CR)?\s*$", re.IGNORECASE
+)
+
+
+def parse_ocbc_balance(amount_str: str, suffix: str | None = None) -> str:
+    """Parse OCBC balance, handling DR (debit/negative) suffix."""
+    val = parse_amount_generic(amount_str)
+    if not val:
+        return "0"
+    if suffix and suffix.upper() == "DR":
+        # DR means debit balance (negative)
+        return str(-Decimal(val))
+    return val
+
+
+def parse_date_ocbc(raw: str, year_hint: str = "2024") -> str:
+    """Parse 'DD MON' format with year hint."""
+    parts = raw.strip().split()
+    if len(parts) != 2:
+        return ""
+    day, month = parts
+    m = MONTH_MAP.get(month.capitalize()[:3])
+    if not m:
+        return ""
+    return f"{year_hint}-{m}-{day.zfill(2)}"
+
+
+def extract_ocbc_transactions(all_text: str) -> list[Transaction]:
+    """Extract transactions from OCBC-style bank statements."""
+    transactions = []
+    lines = all_text.split("\n")
+
+    # Try to extract year from statement period
+    year_match = re.search(r"(\d{1,2}\s+[A-Z]{3})\s+(\d{4})\s+TO\s+(\d{1,2}\s+[A-Z]{3})\s+(\d{4})", all_text, re.IGNORECASE)
+    year_hint = year_match.group(4) if year_match else "2024"
+
+    for line in lines:
+        line_stripped = line.strip()
+
+        # Check for BALANCE B/F (starting balance)
+        bf_match = OCBC_BALANCE_BF.search(line_stripped)
+        if bf_match:
+            bal = parse_ocbc_balance(bf_match.group(1), bf_match.group(2))
+            transactions.append(Transaction(
+                date="", description="Starting balance",
+                debit="", credit="", balance=bal,
+            ))
+            continue
+
+        # Check for BALANCE C/F (ending balance)
+        cf_match = OCBC_BALANCE_CF.search(line_stripped)
+        if cf_match:
+            bal = parse_ocbc_balance(cf_match.group(1), cf_match.group(2))
+            transactions.append(Transaction(
+                date="", description="Ending balance",
+                debit="", credit="", balance=bal,
+            ))
+            continue
+
+        # Skip totals and non-transaction lines
+        if line_stripped.lower().startswith("total ") or not line_stripped:
+            continue
+
+        # Try to match transaction line: DD MON DD MON Description amounts
+        txn_match = OCBC_TXN_PATTERN.match(line_stripped)
+        if txn_match:
+            txn_date_raw = txn_match.group(1)
+            # value_date_raw = txn_match.group(2)  # not used
+            remainder = txn_match.group(3).strip()
+
+            date = parse_date_ocbc(txn_date_raw, year_hint)
+            if not date:
+                continue
+
+            # Extract amounts from the end of the remainder
+            # Pattern: description followed by 1-3 amounts at the end
+            # e.g., "PAYMENT/TRANSFER 3,200.00 3,060.00"
+            # e.g., "CHARGES 10.00 3,050.00"
+            amount_pattern = re.findall(r"([\d,]+\.\d{2})", remainder)
+            if not amount_pattern:
+                continue
+
+            # Remove amounts from description
+            desc_part = remainder
+            for amt in amount_pattern:
+                desc_part = desc_part.replace(amt, "").strip()
+            description = " ".join(desc_part.split()).strip(" ,.-")
+
+            if len(amount_pattern) >= 2:
+                # Last amount is always the balance
+                balance = parse_amount_generic(amount_pattern[-1])
+                amount = parse_amount_generic(amount_pattern[-2])
+
+                # Determine debit vs credit by comparing with balance change
+                # If we have a previous balance, we can figure out direction
+                if transactions:
+                    prev_bal = Decimal(transactions[-1].balance) if transactions[-1].balance else Decimal(0)
+                    cur_bal = Decimal(balance) if balance else Decimal(0)
+                    amt_val = Decimal(amount) if amount else Decimal(0)
+
+                    if abs((prev_bal + amt_val) - cur_bal) < Decimal("0.02"):
+                        # It's a credit (deposit)
+                        transactions.append(Transaction(
+                            date=date, description=description,
+                            debit="", credit=amount, balance=balance,
+                        ))
+                    else:
+                        # It's a debit (withdrawal)
+                        transactions.append(Transaction(
+                            date=date, description=description,
+                            debit=amount, credit="", balance=balance,
+                        ))
+                else:
+                    transactions.append(Transaction(
+                        date=date, description=description,
+                        debit=amount, credit="", balance=balance,
+                    ))
+            elif len(amount_pattern) == 1:
+                balance = parse_amount_generic(amount_pattern[0])
+                transactions.append(Transaction(
+                    date=date, description=description,
+                    debit="", credit="", balance=balance,
+                ))
+
+    return transactions
+
+
+# ---------------------------------------------------------------------------
+# Bank of America format: sectioned deposits/withdrawals
+# ---------------------------------------------------------------------------
+
+def extract_boa_transactions(all_text: str) -> list[Transaction]:
+    """Extract transactions from Bank of America-style statements."""
     transactions = []
 
-    # Try to extract starting and ending balance from summary
+    # Extract starting and ending balance
     starting_match = re.search(
         r"[Bb]eginning balance.*?\$?([\d,]+\.\d{2})", all_text
     )
@@ -174,7 +346,6 @@ def extract_text_transactions(pdf) -> list[Transaction]:
             balance=parse_amount_generic(starting_match.group(1)),
         ))
 
-    # Detect sections: deposits/credits vs withdrawals/debits
     current_section = ""
     lines = all_text.split("\n")
 
@@ -182,7 +353,6 @@ def extract_text_transactions(pdf) -> list[Transaction]:
         line_stripped = line.strip()
         lower = line_stripped.lower()
 
-        # Detect section headers
         if "deposits and other credits" in lower or "deposits/credits" in lower:
             current_section = "credit"
             continue
@@ -198,7 +368,6 @@ def extract_text_transactions(pdf) -> list[Transaction]:
         elif re.match(r"^total\s+", lower):
             continue
 
-        # Try to match transaction lines
         match = TEXT_TXN_PATTERN.match(line_stripped)
         if match and current_section:
             date_raw = match.group(1)
@@ -212,7 +381,6 @@ def extract_text_transactions(pdf) -> list[Transaction]:
             if not date or not amount:
                 continue
 
-            # Determine debit vs credit
             if current_section == "credit" and not is_neg:
                 transactions.append(Transaction(
                     date=date, description=description,
@@ -231,7 +399,7 @@ def extract_text_transactions(pdf) -> list[Transaction]:
             balance=parse_amount_generic(ending_match.group(1)),
         ))
 
-    # Try to compute running balances if we have starting balance
+    # Compute running balances
     if transactions and transactions[0].description == "Starting balance" and transactions[0].balance:
         running = Decimal(transactions[0].balance)
         for t in transactions[1:]:
@@ -241,6 +409,41 @@ def extract_text_transactions(pdf) -> list[Transaction]:
             debit = Decimal(t.debit) if t.debit else Decimal(0)
             running = running + credit - debit
             t.balance = str(running)
+
+    return transactions
+
+
+# ---------------------------------------------------------------------------
+# Generic text format fallback
+# ---------------------------------------------------------------------------
+
+def extract_generic_text_transactions(all_text: str) -> list[Transaction]:
+    """Fallback: try to extract any date + amount patterns."""
+    transactions = []
+    lines = all_text.split("\n")
+
+    for line in lines:
+        match = TEXT_TXN_PATTERN.match(line.strip())
+        if match:
+            date_raw = match.group(1)
+            description = match.group(2).strip()
+            amount_raw = match.group(3).strip()
+
+            date = parse_date_text(date_raw)
+            amount = parse_amount_generic(amount_raw)
+            if not date or not amount:
+                continue
+
+            if is_negative_amount(amount_raw):
+                transactions.append(Transaction(
+                    date=date, description=description,
+                    debit=amount, credit="", balance="",
+                ))
+            else:
+                transactions.append(Transaction(
+                    date=date, description=description,
+                    debit="", credit=amount, balance="",
+                ))
 
     return transactions
 
