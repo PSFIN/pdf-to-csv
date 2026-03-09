@@ -1,5 +1,7 @@
 import asyncio
+import gc
 import json
+import os
 import shutil
 import uuid
 from dataclasses import dataclass, field
@@ -68,15 +70,24 @@ async def process_pdf_job(job_id: str):
         all_transactions = []
         pages_with_data = 0
 
-        for i, page in enumerate(pdf.pages):
+        for i in range(total_pages):
+            # Open and process one page at a time to minimize memory
+            page = pdf.pages[i]
             txns = extract_page_transactions(page)
 
             if txns:
                 pages_with_data += 1
                 all_transactions.extend(txns)
 
-            # Send progress every 5 pages or on first/last page
-            if i == 0 or i == total_pages - 1 or (i + 1) % 5 == 0:
+            # Flush page from cache to free memory
+            page.flush_cache()
+
+            # Force garbage collection every 50 pages
+            if (i + 1) % 50 == 0:
+                gc.collect()
+
+            # Send progress every 10 pages or on first/last page
+            if i == 0 or i == total_pages - 1 or (i + 1) % 10 == 0:
                 await q.put(progress_event(
                     f"Processing page {i + 1}/{total_pages} — {len(all_transactions)} transactions found so far",
                     i + 1,
@@ -85,6 +96,7 @@ async def process_pdf_job(job_id: str):
                 await asyncio.sleep(0)
 
         pdf.close()
+        gc.collect()
 
         await q.put(step_event(f"Table extraction complete. Scanned {total_pages} pages."))
         await asyncio.sleep(0)
@@ -131,6 +143,10 @@ async def process_pdf_job(job_id: str):
         write_csv(all_transactions, csv_path)
         job.csv_path = csv_path
 
+        # Clean up uploaded PDF to save disk space
+        if job.pdf_path and job.pdf_path.exists():
+            job.pdf_path.unlink()
+
         await q.put(step_event("CSV file generated successfully!"))
         await asyncio.sleep(0)
 
@@ -138,6 +154,8 @@ async def process_pdf_job(job_id: str):
 
     except Exception as e:
         await q.put({"type": "error", "data": {"message": f"Error: {str(e)}"}})
+    finally:
+        gc.collect()
 
 
 @app.post("/api/upload")
