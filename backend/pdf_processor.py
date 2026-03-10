@@ -159,6 +159,13 @@ def detect_text_format(all_text: str) -> str:
     if "balance b/f" in lower or "balance c/f" in lower:
         return "ocbc"
 
+    # CommBank (CBA) style: OPENING/CLOSING BALANCE with $X,XXX.XXCR format
+    has_opening = bool(re.search(r"opening\s+balance", lower))
+    has_closing = bool(re.search(r"closing\s+balance", lower))
+    has_cr_balance = bool(re.search(r"\$[\d,]+\.\d{2}CR", all_text))
+    if (has_opening or has_closing) and has_cr_balance:
+        return "commbank"
+
     # Frost Bank style: sections with DEPOSITS/CREDITS + MM-DD date patterns
     # Check both raw and cleaned text for balance keywords
     has_frost_sections = ("deposits/credits" in lower or "withdrawals/debits" in lower)
@@ -199,6 +206,8 @@ def extract_text_transactions(pdf) -> list[Transaction]:
 
     if text_fmt == "ocbc":
         return extract_ocbc_transactions(all_text)
+    elif text_fmt == "commbank":
+        return extract_commbank_transactions(all_text)
     elif text_fmt == "frost":
         return extract_frost_transactions(all_text)
     elif text_fmt == "boa":
@@ -348,6 +357,270 @@ def extract_ocbc_transactions(all_text: str) -> list[Transaction]:
                 ))
 
     return transactions
+
+
+# ---------------------------------------------------------------------------
+# CommBank (CBA) format: DD Mon dates, multi-line txns, $X,XXX.XXCR balances
+# Debits: "amount $", Credits: "$amount", Balance: "$amountCR"
+# ---------------------------------------------------------------------------
+
+# Date line: starts with "DD Mon" (e.g., "07 Dec", "10 Dec")
+COMMBANK_DATE_PATTERN = re.compile(r"^(\d{2}\s+[A-Z][a-z]{2})\b\s*(.*)")
+
+# Balance at end of line: $X,XXX.XXCR or $X,XXX.XXDR
+COMMBANK_BALANCE_END = re.compile(r"\$([\d,]+\.\d{2})(CR|DR)\s*$")
+
+# Debit pattern: amount $ $balance(CR|DR)  (number followed by " $ " then balance)
+COMMBANK_DEBIT_PATTERN = re.compile(
+    r"([\d,]+\.\d{2})\s*\$\s*\$([\d,]+\.\d{2})(CR|DR)\s*$"
+)
+
+# Credit pattern: $amount $balance(CR|DR)  (two $ amounts, last has CR or DR)
+COMMBANK_CREDIT_PATTERN = re.compile(
+    r"\$([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})(CR|DR)\s*$"
+)
+
+# Opening balance: "OPENING BALANCE $1,819.85 CR" or "$1,819.85CR"
+COMMBANK_OPENING = re.compile(
+    r"OPENING\s+BALANCE\s+\$([\d,]+\.\d{2})\s*CR", re.IGNORECASE
+)
+
+# Closing balance: "CLOSING BALANCE $631.56 CR"
+COMMBANK_CLOSING = re.compile(
+    r"CLOSING\s+BALANCE\s+\$([\d,]+\.\d{2})\s*CR", re.IGNORECASE
+)
+
+
+def parse_commbank_balance(amount_str: str, suffix: str = "CR") -> str:
+    """Parse CommBank balance. CR = positive, DR = negative (overdrawn)."""
+    val = parse_amount_generic(amount_str)
+    if not val:
+        return "0"
+    if suffix.upper() == "DR":
+        return str(-Decimal(val))
+    return val
+
+
+def parse_date_commbank(raw: str, year_hint: str = "2024") -> str:
+    """Parse 'DD Mon' format with year hint. Handles year rollover for cross-year statements."""
+    parts = raw.strip().split()
+    if len(parts) != 2:
+        return ""
+    day, month = parts
+    m = MONTH_MAP.get(month.capitalize()[:3])
+    if not m:
+        return ""
+    return f"{year_hint}-{m}-{day.zfill(2)}"
+
+
+def extract_commbank_transactions(all_text: str) -> list[Transaction]:
+    """Extract transactions from CommBank (CBA) bank statements.
+
+    CommBank uses multi-line transactions:
+    - Line 1: "DD Mon DESCRIPTION_START"
+    - Line 2+: continuation of description
+    - Final line: "... AMOUNT $ $BALANCE_CR" (debit) or "... $AMOUNT $BALANCE_CR" (credit)
+    """
+    transactions = []
+
+    # Extract statement period for year hints
+    # "7 Dec 2024 - 6 Jan 2025" or "Statement Period DD Mon YYYY"
+    period_match = re.search(
+        r"(\d{1,2}\s+[A-Z][a-z]{2})\s+(\d{4})\s*[-–]\s*(\d{1,2}\s+[A-Z][a-z]{2})\s+(\d{4})",
+        all_text,
+    )
+    start_year = period_match.group(2) if period_match else "2024"
+    end_year = period_match.group(4) if period_match else start_year
+
+    # Build a month→year lookup for cross-year statements (e.g., Dec 2024 - Jan 2025)
+    # Parse start and end months
+    start_month_str = period_match.group(1).split()[1] if period_match else "Jan"
+    end_month_str = period_match.group(3).split()[1] if period_match else "Dec"
+    start_month_num = int(MONTH_MAP.get(start_month_str[:3], "01"))
+    end_month_num = int(MONTH_MAP.get(end_month_str[:3], "12"))
+
+    def get_year_for_month(month_str: str) -> str:
+        """Determine the correct year for a given month in cross-year statements."""
+        m = int(MONTH_MAP.get(month_str[:3], "01"))
+        if int(start_year) != int(end_year):
+            # Cross-year: months >= start_month use start_year, others use end_year
+            if m >= start_month_num:
+                return start_year
+            else:
+                return end_year
+        return start_year
+
+    # Extract opening balance
+    opening_match = COMMBANK_OPENING.search(all_text)
+    if opening_match:
+        transactions.append(Transaction(
+            date="", description="Starting balance",
+            debit="", credit="",
+            balance=parse_amount_generic(opening_match.group(1)),
+        ))
+
+    # Process lines to extract transactions
+    lines = all_text.split("\n")
+
+    # State for multi-line transaction accumulation
+    current_date = ""
+    current_desc_lines: list[str] = []
+    in_transactions = False
+
+    for line in lines:
+        line_stripped = line.strip()
+        lower = line_stripped.lower()
+
+        # Skip page headers and non-transaction content
+        if not line_stripped:
+            continue
+        if lower.startswith("statement ") and "page" in lower:
+            continue
+        if lower.startswith("account number"):
+            continue
+        if lower.startswith("date") and "transaction" in lower and "balance" in lower:
+            in_transactions = True
+            continue
+
+        if not in_transactions:
+            continue
+
+        # Stop at closing balance or summary sections
+        if "closing balance" in lower:
+            # Flush any pending transaction first
+            if current_date and current_desc_lines:
+                _flush_commbank_txn(transactions, current_date, current_desc_lines, get_year_for_month)
+                current_date = ""
+                current_desc_lines = []
+            continue
+        if "opening balance" in lower and "total debits" not in lower:
+            # Skip the opening balance line (already captured)
+            # But check if there's a balance on this line we need
+            bal_match = COMMBANK_BALANCE_END.search(line_stripped)
+            if bal_match and not transactions:
+                transactions.append(Transaction(
+                    date="", description="Starting balance",
+                    debit="", credit="",
+                    balance=parse_amount_generic(bal_match.group(1)),
+                ))
+            continue
+        if "opening balance - total debits" in lower:
+            # Summary line at end: skip
+            continue
+        if lower.startswith("transaction summary") or lower.startswith("important information"):
+            in_transactions = False
+            continue
+
+        # Check if this line starts a new transaction (has a date)
+        date_match = COMMBANK_DATE_PATTERN.match(line_stripped)
+        if date_match:
+            # Flush previous transaction
+            if current_date and current_desc_lines:
+                _flush_commbank_txn(transactions, current_date, current_desc_lines, get_year_for_month)
+
+            current_date = date_match.group(1)
+            remainder = date_match.group(2).strip()
+            current_desc_lines = [remainder] if remainder else []
+        else:
+            # Continuation line for current transaction
+            if current_date:
+                current_desc_lines.append(line_stripped)
+
+    # Flush last pending transaction
+    if current_date and current_desc_lines:
+        _flush_commbank_txn(transactions, current_date, current_desc_lines, get_year_for_month)
+
+    # Add closing balance
+    closing_match = COMMBANK_CLOSING.search(all_text)
+    if closing_match:
+        transactions.append(Transaction(
+            date="", description="Ending balance",
+            debit="", credit="",
+            balance=parse_amount_generic(closing_match.group(1)),
+        ))
+
+    return transactions
+
+
+def _flush_commbank_txn(
+    transactions: list[Transaction],
+    date_raw: str,
+    desc_lines: list[str],
+    get_year_fn,
+) -> None:
+    """Parse accumulated multi-line CommBank transaction and append to list."""
+    # Combine all description lines
+    full_text = " ".join(desc_lines)
+
+    # Try to find balance (line ending with $X,XXX.XX CR or $X,XXX.XX DR)
+    # Check the LAST line that has amounts
+    amount_line = ""
+    for dline in reversed(desc_lines):
+        if COMMBANK_BALANCE_END.search(dline):
+            amount_line = dline
+            break
+
+    if not amount_line:
+        # No balance found — skip this entry (might be a header or non-transaction)
+        return
+
+    # Determine debit vs credit
+    debit_match = COMMBANK_DEBIT_PATTERN.search(amount_line)
+    credit_match = COMMBANK_CREDIT_PATTERN.search(amount_line)
+
+    debit = ""
+    credit = ""
+    balance = ""
+
+    if debit_match:
+        debit = parse_amount_generic(debit_match.group(1))
+        balance = parse_commbank_balance(debit_match.group(2), debit_match.group(3))
+        # Remove the amount portion from description
+        desc_text = amount_line[:debit_match.start()].strip()
+    elif credit_match:
+        credit = parse_amount_generic(credit_match.group(1))
+        balance = parse_commbank_balance(credit_match.group(2), credit_match.group(3))
+        desc_text = amount_line[:credit_match.start()].strip()
+    else:
+        # Only balance, no clear debit/credit amount
+        bal_match = COMMBANK_BALANCE_END.search(amount_line)
+        if bal_match:
+            balance = parse_commbank_balance(bal_match.group(1), bal_match.group(2))
+            desc_text = amount_line[:bal_match.start()].strip()
+        else:
+            return
+
+    # Build full description from all lines except amounts
+    # Replace the amount line with its cleaned version
+    clean_desc_parts = []
+    for dline in desc_lines:
+        if dline == amount_line:
+            if desc_text:
+                clean_desc_parts.append(desc_text)
+        else:
+            # Skip lines that are just noise (Card xx, Value Date, etc. are useful context)
+            clean_desc_parts.append(dline)
+
+    description = " ".join(clean_desc_parts)
+    # Clean up extra whitespace
+    description = " ".join(description.split())
+
+    # Skip if description indicates it's a balance line we already captured
+    if not description or description.lower().startswith("opening balance"):
+        return
+
+    # Parse date with year
+    month_str = date_raw.strip().split()[1]
+    year = get_year_fn(month_str)
+    date = parse_date_commbank(date_raw, year)
+
+    if not date:
+        return
+
+    transactions.append(Transaction(
+        date=date, description=description,
+        debit=debit, credit=credit, balance=balance,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +1106,11 @@ def detect_format(pdf) -> str:
         if "balance b/f" in lower or "balance c/f" in lower:
             text_score += 10
         if "beginning balance" in lower or "ending balance" in lower:
+            text_score += 5
+        # CommBank: OPENING/CLOSING BALANCE with $CR format
+        if "opening balance" in lower or "closing balance" in lower:
+            text_score += 10
+        if re.search(r"\$[\d,]+\.\d{2}CR", text):
             text_score += 5
 
     if table_score > text_score and table_score > 0:
