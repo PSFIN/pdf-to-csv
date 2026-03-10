@@ -152,15 +152,38 @@ def parse_date_text(raw: str, year_hint: str = "") -> str:
 def detect_text_format(all_text: str) -> str:
     """Detect which text-based format this is."""
     lower = all_text.lower()
+    # Also check a cleaned version (some PDFs have formatting chars like _ and ¬)
+    cleaned_lower = re.sub(r"[_¬]", "", lower)
+
     # OCBC style: "DD MON DD MON Description amounts"
     if "balance b/f" in lower or "balance c/f" in lower:
         return "ocbc"
+
+    # Frost Bank style: sections with DEPOSITS/CREDITS + MM-DD date patterns
+    # Check both raw and cleaned text for balance keywords
+    has_frost_sections = ("deposits/credits" in lower or "withdrawals/debits" in lower)
+    has_frost_balance = ("balance last statement" in lower or "balance last statement" in cleaned_lower)
+    has_mm_dd_dates = bool(re.search(r"\d{2}-\d{2}\s+[\d,]+\.\d{2}", all_text))
+    if has_frost_sections and (has_frost_balance or has_mm_dd_dates):
+        return "frost"
+
     # Bank of America style: sections with "Deposits and other credits"
     if "deposits and other credits" in lower or "withdrawals and other debits" in lower:
         return "boa"
+
+    # Wells Fargo / generic sectioned: "beginning balance" / "ending balance" with dates
+    if ("beginning balance" in lower or "ending balance" in lower) and \
+       re.search(r"\d{1,2}/\d{1,2}", all_text):
+        return "generic_sectioned"
+
     # Generic: try to find MM/DD/YY patterns
     if re.search(r"\d{2}/\d{2}/\d{2,4}", all_text):
         return "generic"
+
+    # Fallback: try MM-DD patterns (common in many statements)
+    if has_mm_dd_dates:
+        return "frost"
+
     return "generic"
 
 
@@ -176,8 +199,12 @@ def extract_text_transactions(pdf) -> list[Transaction]:
 
     if text_fmt == "ocbc":
         return extract_ocbc_transactions(all_text)
+    elif text_fmt == "frost":
+        return extract_frost_transactions(all_text)
     elif text_fmt == "boa":
         return extract_boa_transactions(all_text)
+    elif text_fmt == "generic_sectioned":
+        return extract_generic_sectioned_transactions(all_text)
     else:
         return extract_generic_text_transactions(all_text)
 
@@ -414,6 +441,323 @@ def extract_boa_transactions(all_text: str) -> list[Transaction]:
 
 
 # ---------------------------------------------------------------------------
+# Frost Bank format: MM-DD dates, DEPOSITS/CREDITS & WITHDRAWALS/DEBITS sections
+# Amount appears BEFORE description: "08-06 244.12 ELECTRONIC DEPOSIT ..."
+# ---------------------------------------------------------------------------
+
+# Matches: 08-06 244.12 ELECTRONIC DEPOSIT UBER USA ...
+FROST_TXN_PATTERN = re.compile(
+    r"^(\d{2}-\d{2})\s+([\d,]+\.\d{2})\s+(.+)$"
+)
+
+# For DAILY BALANCE section: matches "MM-DD AMOUNT" or "MM-DD AMOUNT- OD"
+FROST_DAILY_BAL_PATTERN = re.compile(
+    r"(\d{2}-\d{2})\s+([\d,]+\.\d{2})(-?\s*OD)?",
+)
+
+
+def clean_frost_text(text: str) -> str:
+    """Clean Frost Bank PDF text by removing formatting characters and fixing spaced-out numbers."""
+    # Remove formatting characters
+    cleaned = re.sub(r"[¬]", "", text)
+    # Compact spaced-out numbers: "7 . 0 2" → "7.02", "4 6 0 . 0 5" → "460.05"
+    # Repeatedly collapse digit-space-digit and digit-space-dot patterns
+    for _ in range(10):
+        prev = cleaned
+        cleaned = re.sub(r"(\d) (\d)", r"\1\2", cleaned)
+        cleaned = re.sub(r"(\d) \. (\d)", r"\1.\2", cleaned)
+        cleaned = re.sub(r"(\d) \.(\d)", r"\1.\2", cleaned)
+        cleaned = re.sub(r"(\d)\. (\d)", r"\1.\2", cleaned)
+        if cleaned == prev:
+            break
+    return cleaned
+
+
+def parse_frost_balance(amount_str: str, od_suffix: str | None = None) -> str:
+    """Parse Frost balance, handling '- OD' (overdrawn = negative) suffix."""
+    val = parse_amount_generic(amount_str)
+    if not val:
+        return "0"
+    if od_suffix and "OD" in od_suffix.upper():
+        return str(-Decimal(val))
+    return val
+
+
+def parse_date_frost(raw: str, year_hint: str = "2024") -> str:
+    """Parse 'MM-DD' format with year hint."""
+    parts = raw.strip().split("-")
+    if len(parts) != 2:
+        return ""
+    month, day = parts
+    return f"{year_hint}-{month.zfill(2)}-{day.zfill(2)}"
+
+
+def extract_frost_transactions(all_text: str) -> list[Transaction]:
+    """Extract transactions from Frost Bank-style statements."""
+    transactions = []
+
+    # Clean text for balance/summary detection (fixes spaced-out numbers)
+    cleaned_text = clean_frost_text(all_text)
+
+    # Extract year from statement date in header (e.g., "08-30-2024")
+    year_match = re.search(r"(\d{2})-(\d{2})-(\d{4})", all_text)
+    year_hint = year_match.group(3) if year_match else "2024"
+
+    # --- Extract starting/ending balance from DAILY BALANCE section ---
+    # Use ORIGINAL text for daily balance (numbers aren't spaced out there)
+    daily_balances = []
+    in_daily_balance = False
+    raw_lines = all_text.split("\n")
+
+    for line in raw_lines:
+        lower = line.strip().lower()
+        if "daily balance" in lower:
+            in_daily_balance = True
+            continue
+        if in_daily_balance:
+            # Parse all MM-DD balance entries on this line (pipe-separated columns)
+            entries = FROST_DAILY_BAL_PATTERN.findall(line)
+            for date_str, amount, od in entries:
+                daily_balances.append((date_str, amount, od))
+            # If line has no balance entries and doesn't look like a header, stop
+            if not entries and not lower.startswith("date") and line.strip() and "|" not in line:
+                in_daily_balance = False
+
+    # Also try CLEANED summary header line for balances (handles spaced-out numbers)
+    start_bal = None
+    end_bal = None
+
+    start_match = re.search(
+        r"BALANCE\s+LAST\s+STATEMENT.*?([\d,]+\.?\d*)", cleaned_text, re.IGNORECASE
+    )
+    if start_match:
+        start_bal = parse_amount_generic(start_match.group(1))
+
+    end_match = re.search(
+        r"BALANCE\s+THIS\s+STATEMENT.*?([\d,]+\.?\d*)\s*(-?\s*OD)?", cleaned_text, re.IGNORECASE
+    )
+    if end_match:
+        end_bal = parse_frost_balance(end_match.group(1), end_match.group(2))
+
+    # Fallback: use DAILY BALANCE section
+    if daily_balances:
+        if not start_bal:
+            first = daily_balances[0]
+            start_bal = parse_frost_balance(first[1], first[2] if first[2] else None)
+        if not end_bal:
+            last = daily_balances[-1]
+            end_bal = parse_frost_balance(last[1], last[2] if last[2] else None)
+
+    if start_bal:
+        transactions.append(Transaction(
+            date="", description="Starting balance",
+            debit="", credit="", balance=start_bal,
+        ))
+
+    # --- Extract transactions from DEPOSITS/CREDITS and WITHDRAWALS/DEBITS sections ---
+    # Use ORIGINAL text for transactions (normal formatting)
+    current_section = ""
+
+    for line in raw_lines:
+        line_stripped = line.strip()
+        lower = line_stripped.lower()
+
+        # Detect section headers (with or without dashes)
+        if "deposits/credits" in lower or "deposits / credits" in lower:
+            current_section = "credit"
+            continue
+        elif "withdrawals/debits" in lower or "withdrawals / debits" in lower:
+            current_section = "debit"
+            continue
+        elif "daily balance" in lower or "daily ledger" in lower:
+            current_section = ""
+            continue
+        elif "service charge/fee summary" in lower or "service fee summary" in lower:
+            current_section = ""
+            continue
+
+        # Skip header rows within sections
+        if lower.startswith("date") and ("amount" in lower or "transaction" in lower):
+            continue
+
+        # Skip separator lines (all dashes/underscores/spaces)
+        if re.match(r"^[\-_\s]+$", line_stripped):
+            continue
+
+        # Try to match Frost transaction: MM-DD AMOUNT DESCRIPTION
+        txn_match = FROST_TXN_PATTERN.match(line_stripped)
+        if txn_match and current_section:
+            date_raw = txn_match.group(1)
+            amount_raw = txn_match.group(2)
+            description = txn_match.group(3).strip()
+
+            date = parse_date_frost(date_raw, year_hint)
+            amount = parse_amount_generic(amount_raw)
+
+            if not date or not amount:
+                continue
+
+            if current_section == "credit":
+                transactions.append(Transaction(
+                    date=date, description=description,
+                    debit="", credit=amount, balance="",
+                ))
+            else:
+                transactions.append(Transaction(
+                    date=date, description=description,
+                    debit=amount, credit="", balance="",
+                ))
+
+    # Add ending balance
+    if end_bal:
+        transactions.append(Transaction(
+            date="", description="Ending balance",
+            debit="", credit="", balance=end_bal,
+        ))
+
+    # Compute running balances from starting balance
+    if transactions and transactions[0].description == "Starting balance" and transactions[0].balance:
+        running = Decimal(transactions[0].balance)
+        for t in transactions[1:]:
+            if t.description == "Ending balance":
+                continue
+            credit = Decimal(t.credit) if t.credit else Decimal(0)
+            debit = Decimal(t.debit) if t.debit else Decimal(0)
+            running = running + credit - debit
+            t.balance = str(running)
+
+    return transactions
+
+
+# ---------------------------------------------------------------------------
+# Generic sectioned format (Wells Fargo, Chase, and similar)
+# Statements with "beginning/ending balance" and date-based transactions
+# ---------------------------------------------------------------------------
+
+# Matches: MM/DD DESCRIPTION AMOUNT (no year in date)
+GENERIC_SHORT_DATE_PATTERN = re.compile(
+    r"^(\d{1,2}/\d{1,2})\s+(.+?)\s+([\-\$]?[\d,]+\.\d{2})\s*$"
+)
+
+
+def extract_generic_sectioned_transactions(all_text: str) -> list[Transaction]:
+    """Extract from statements with beginning/ending balance and sectioned transactions."""
+    transactions = []
+
+    # Try to extract year from statement
+    year_match = re.search(r"(\d{1,2}/\d{1,2}/(\d{4}))", all_text)
+    if not year_match:
+        year_match = re.search(r"(20\d{2})", all_text)
+    year_hint = year_match.group(2) if year_match and year_match.lastindex >= 2 else "2024"
+
+    # Extract starting and ending balance
+    starting_match = re.search(
+        r"[Bb]eginning balance.*?\$?([\d,]+\.\d{2})", all_text
+    )
+    ending_match = re.search(
+        r"[Ee]nding balance.*?\$?([\d,]+\.\d{2})", all_text
+    )
+
+    if starting_match:
+        transactions.append(Transaction(
+            date="", description="Starting balance",
+            debit="", credit="",
+            balance=parse_amount_generic(starting_match.group(1)),
+        ))
+
+    current_section = ""
+    lines = all_text.split("\n")
+
+    for line in lines:
+        line_stripped = line.strip()
+        lower = line_stripped.lower()
+
+        # Detect sections
+        if "deposit" in lower and ("credit" in lower or "addition" in lower):
+            current_section = "credit"
+            continue
+        elif "withdrawal" in lower or "debit" in lower or "check" in lower:
+            current_section = "debit"
+            continue
+        elif "daily balance" in lower or "daily ledger" in lower:
+            current_section = ""
+            continue
+        elif re.match(r"^total\s+", lower):
+            continue
+
+        # Try full date pattern first (MM/DD/YYYY or MM/DD/YY)
+        full_match = TEXT_TXN_PATTERN.match(line_stripped)
+        if full_match and current_section:
+            date_raw = full_match.group(1)
+            description = full_match.group(2).strip()
+            amount_raw = full_match.group(3).strip()
+            date = parse_date_text(date_raw)
+            amount = parse_amount_generic(amount_raw)
+            is_neg = is_negative_amount(amount_raw)
+
+            if date and amount:
+                if current_section == "credit" and not is_neg:
+                    transactions.append(Transaction(
+                        date=date, description=description,
+                        debit="", credit=amount, balance="",
+                    ))
+                else:
+                    transactions.append(Transaction(
+                        date=date, description=description,
+                        debit=amount, credit="", balance="",
+                    ))
+                continue
+
+        # Try short date pattern (MM/DD without year)
+        short_match = GENERIC_SHORT_DATE_PATTERN.match(line_stripped)
+        if short_match and current_section:
+            date_raw = short_match.group(1)
+            description = short_match.group(2).strip()
+            amount_raw = short_match.group(3).strip()
+
+            parts = date_raw.split("/")
+            if len(parts) == 2:
+                date = f"{year_hint}-{parts[0].zfill(2)}-{parts[1].zfill(2)}"
+            else:
+                continue
+
+            amount = parse_amount_generic(amount_raw)
+            is_neg = is_negative_amount(amount_raw)
+
+            if amount:
+                if current_section == "credit" and not is_neg:
+                    transactions.append(Transaction(
+                        date=date, description=description,
+                        debit="", credit=amount, balance="",
+                    ))
+                else:
+                    transactions.append(Transaction(
+                        date=date, description=description,
+                        debit=amount, credit="", balance="",
+                    ))
+
+    if ending_match:
+        transactions.append(Transaction(
+            date="", description="Ending balance",
+            debit="", credit="",
+            balance=parse_amount_generic(ending_match.group(1)),
+        ))
+
+    # Compute running balances
+    if transactions and transactions[0].description == "Starting balance" and transactions[0].balance:
+        running = Decimal(transactions[0].balance)
+        for t in transactions[1:]:
+            if t.description == "Ending balance":
+                continue
+            credit = Decimal(t.credit) if t.credit else Decimal(0)
+            debit = Decimal(t.debit) if t.debit else Decimal(0)
+            running = running + credit - debit
+            t.balance = str(running)
+
+    return transactions
+
+
+# ---------------------------------------------------------------------------
 # Generic text format fallback
 # ---------------------------------------------------------------------------
 
@@ -459,6 +803,9 @@ def extract_page_transactions(page) -> list[Transaction]:
 
 def detect_format(pdf) -> str:
     """Detect if PDF uses tables or text-based format."""
+    table_score = 0
+    text_score = 0
+
     # Check first few pages for tables
     for i in range(min(5, len(pdf.pages))):
         tables = pdf.pages[i].extract_tables()
@@ -468,7 +815,28 @@ def detect_format(pdf) -> str:
                     # Check if it looks like a transaction table
                     details = (row[1] or "").strip()
                     if details in ("Details",) or "Account Activity" in (row[0] or ""):
-                        return "table"
+                        table_score += 10
+                    # Generic: any 5+ column table with date-like first cell
+                    first_cell = (row[0] or "").strip()
+                    if re.match(r"\w{3}\s+\d{1,2}\s+\d{4}", first_cell):
+                        table_score += 5
+
+        # Check text content for known text-based formats
+        text = pdf.pages[i].extract_text() or ""
+        lower = text.lower()
+        if "deposits/credits" in lower or "withdrawals/debits" in lower:
+            text_score += 10
+        if "balance last statement" in lower or "balance this statement" in lower:
+            text_score += 10
+        if "deposits and other credits" in lower:
+            text_score += 10
+        if "balance b/f" in lower or "balance c/f" in lower:
+            text_score += 10
+        if "beginning balance" in lower or "ending balance" in lower:
+            text_score += 5
+
+    if table_score > text_score and table_score > 0:
+        return "table"
     return "text"
 
 
