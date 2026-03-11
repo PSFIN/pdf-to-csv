@@ -1,11 +1,20 @@
 import pdfplumber
 import csv
 import re
+import gc
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from collections import Counter
+
+# OCR imports (optional — gracefully degrade if not installed)
+try:
+    from pdf2image import convert_from_path
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 
 @dataclass
@@ -149,6 +158,107 @@ def parse_date_text(raw: str, year_hint: str = "") -> str:
     return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
 
 
+# ---------------------------------------------------------------------------
+# OCR SUPPORT: for scanned/image-based PDFs
+# ---------------------------------------------------------------------------
+
+def needs_ocr(text: str) -> bool:
+    """Detect if extracted text is too garbled and OCR is needed.
+
+    Heuristics:
+    - Very short text relative to expected content
+    - Low ratio of recognizable words
+    - Common bank keywords are garbled
+    """
+    if not text or len(text.strip()) < 50:
+        return True
+
+    # Check if common bank statement keywords are recognizable
+    lower = text.lower()
+    keywords_found = 0
+    bank_keywords = [
+        "balance", "transaction", "deposit", "withdrawal", "credit",
+        "debit", "statement", "account", "payment", "transfer",
+        "beginning", "ending", "opening", "closing", "date",
+        "description", "amount", "total", "interest", "fee",
+    ]
+    for kw in bank_keywords:
+        if kw in lower:
+            keywords_found += 1
+
+    # If we find fewer than 3 keywords in a full page of text, it's likely garbled
+    if len(text) > 200 and keywords_found < 3:
+        return True
+
+    # Check for excessive garbage characters (non-printable, weird symbols)
+    printable_ratio = sum(1 for c in text if c.isprintable()) / max(len(text), 1)
+    if printable_ratio < 0.85:
+        return True
+
+    # Check if dates and amounts are extractable
+    has_dates = bool(re.search(r"\d{2}/\d{2}", text) or re.search(r"\d{2}\s+[A-Z][a-z]{2}", text))
+    has_amounts = bool(re.search(r"[\d,]+\.\d{2}", text))
+
+    if not has_dates and not has_amounts and len(text) > 300:
+        return True
+
+    return False
+
+
+def ocr_pdf_text(pdf_path: str, dpi: int = 300, callback=None) -> str:
+    """Convert PDF pages to images and OCR them. Returns combined text.
+
+    Args:
+        pdf_path: Path to the PDF file
+        dpi: Resolution for image conversion (higher = better quality but slower)
+        callback: Optional function to call with progress messages
+    """
+    if not OCR_AVAILABLE:
+        raise RuntimeError("OCR not available: install pytesseract and pdf2image")
+
+    if callback:
+        callback("Converting PDF pages to images for OCR...")
+
+    images = convert_from_path(pdf_path, dpi=dpi)
+    all_text = ""
+
+    for i, img in enumerate(images):
+        if callback:
+            callback(f"OCR processing page {i + 1} of {len(images)}...")
+
+        page_text = pytesseract.image_to_string(img)
+        all_text += page_text + "\n"
+
+        # Free memory
+        del img
+        gc.collect()
+
+    del images
+    gc.collect()
+
+    return clean_ocr_text(all_text)
+
+
+def clean_ocr_text(text: str) -> str:
+    """Clean common OCR artifacts from text."""
+    # Remove common OCR noise characters at end of lines
+    text = re.sub(r"\s*[\\|/][€£¥]\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\s+[%&@#]{1,3}\s*$", "", text, flags=re.MULTILINE)
+
+    # Fix common OCR misreads in amounts
+    # "94,98" → "94.98" (comma instead of period in cents, only for 2-digit after comma)
+    text = re.sub(r"(\d+),(\d{2})(\s|$)", r"\1.\2\3", text)
+
+    # Remove stray single characters at end of lines (OCR noise)
+    text = re.sub(r"\s+[a-zA-Z]{1,2}\s*$", "", text, flags=re.MULTILINE)
+
+    # Fix "lnterest" → "Interest" (common OCR l/I confusion)
+    text = text.replace("lnterest", "Interest")
+    text = text.replace("lD:", "ID:")
+
+    return text
+
+
 def detect_text_format(all_text: str) -> str:
     """Detect which text-based format this is."""
     lower = all_text.lower()
@@ -174,6 +284,13 @@ def detect_text_format(all_text: str) -> str:
     if has_frost_sections and (has_frost_balance or has_mm_dd_dates):
         return "frost"
 
+    # Chase style: "TRANSACTION DETAIL" with DATE DESCRIPTION AMOUNT BALANCE columns
+    has_chase_detail = "transaction detail" in lower
+    has_chase_balance = ("beginning balance" in lower or "ending balance" in lower)
+    has_chase_amounts = bool(re.search(r"\d{2}/\d{2}\s+.+?\s+[-]?[\d,]+\.\d{2}\s+[\d,]+\.\d{2}", all_text))
+    if has_chase_detail and has_chase_balance and has_chase_amounts:
+        return "chase"
+
     # Bank of America style: sections with "Deposits and other credits"
     if "deposits and other credits" in lower or "withdrawals and other debits" in lower:
         return "boa"
@@ -194,28 +311,133 @@ def detect_text_format(all_text: str) -> str:
     return "generic"
 
 
-def extract_text_transactions(pdf) -> list[Transaction]:
-    """Extract transactions from text-based PDFs."""
+def _parse_text(all_text: str) -> list[Transaction]:
+    """Route text to the appropriate parser based on detected format."""
+    text_fmt = detect_text_format(all_text)
+
+    if text_fmt == "ocbc":
+        return extract_ocbc_transactions(all_text), text_fmt
+    elif text_fmt == "commbank":
+        return extract_commbank_transactions(all_text), text_fmt
+    elif text_fmt == "chase":
+        return extract_chase_transactions(all_text), text_fmt
+    elif text_fmt == "frost":
+        return extract_frost_transactions(all_text), text_fmt
+    elif text_fmt == "boa":
+        return extract_boa_transactions(all_text), text_fmt
+    elif text_fmt == "generic_sectioned":
+        return extract_generic_sectioned_transactions(all_text), text_fmt
+    else:
+        return extract_generic_text_transactions(all_text), text_fmt
+
+
+def _has_page_images(pdf) -> bool:
+    """Check if the PDF has significant embedded images (likely scanned)."""
+    for i in range(min(3, len(pdf.pages))):
+        images = pdf.pages[i].images
+        if images:
+            # Check if images are large (covering most of the page)
+            for img in images:
+                img_w = img.get("width", 0) or img.get("x1", 0) - img.get("x0", 0)
+                img_h = img.get("height", 0) or img.get("top", 0) - img.get("bottom", 0)
+                page_w = pdf.pages[i].width
+                page_h = pdf.pages[i].height
+                if img_w > page_w * 0.5 and abs(img_h) > page_h * 0.5:
+                    return True
+    return False
+
+
+def extract_text_transactions(pdf, pdf_path: str = "", callback=None) -> list[Transaction]:
+    """Extract transactions from text-based PDFs.
+
+    Strategy:
+    1. Try pdfplumber text extraction first
+    2. Parse with the best-matching parser
+    3. If results are poor (few transactions, many errors) AND PDF has images,
+       retry with OCR
+    """
     all_text = ""
     for page in pdf.pages:
         text = page.extract_text()
         if text:
             all_text += text + "\n"
 
-    text_fmt = detect_text_format(all_text)
+    # Attempt 1: direct text parsing
+    force_ocr = needs_ocr(all_text)
 
-    if text_fmt == "ocbc":
-        return extract_ocbc_transactions(all_text)
-    elif text_fmt == "commbank":
-        return extract_commbank_transactions(all_text)
-    elif text_fmt == "frost":
-        return extract_frost_transactions(all_text)
-    elif text_fmt == "boa":
-        return extract_boa_transactions(all_text)
-    elif text_fmt == "generic_sectioned":
-        return extract_generic_sectioned_transactions(all_text)
+    if not force_ocr:
+        txns, text_fmt = _parse_text(all_text)
+
+        if callback:
+            callback(f"Detected format: {text_fmt.upper()}")
+
+        # Check if results are adequate
+        real_txns = [t for t in txns if t.description not in ("Starting balance", "Ending balance")]
+        has_start = any(t.description == "Starting balance" for t in txns)
+        balance_errors = validate_balances(txns)
+        error_rate = len(balance_errors) / max(len(txns), 1)
+
+        # Results are good if: enough transactions, has start balance, and low error rate
+        results_ok = (
+            len(real_txns) >= 3 and
+            has_start and
+            error_rate < 0.1
+        )
+
+        # Also OK if we have many transactions even without perfect validation
+        if len(real_txns) >= 10 and error_rate < 0.2:
+            results_ok = True
+
+        # If PDF has images (likely scanned), be more strict
+        has_images = _has_page_images(pdf)
+        if has_images and (len(real_txns) < 5 or error_rate > 0.05):
+            results_ok = False
+
+        if results_ok:
+            return txns
+
+        # Results are poor — check if OCR might help
+        if callback:
+            reasons = []
+            if len(real_txns) < 3:
+                reasons.append(f"only {len(real_txns)} transactions")
+            if not has_start:
+                reasons.append("missing starting balance")
+            if error_rate > 0.1:
+                reasons.append(f"{len(balance_errors)} balance errors")
+            reason_str = ", ".join(reasons) if reasons else "poor extraction quality"
+            callback(f"Results inadequate ({reason_str}) — trying OCR...")
     else:
-        return extract_generic_text_transactions(all_text)
+        if callback:
+            callback("Text quality is poor — switching to OCR mode...")
+
+    # Attempt 2: OCR
+    if OCR_AVAILABLE and pdf_path:
+        ocr_text = ocr_pdf_text(pdf_path, dpi=300, callback=callback)
+        ocr_txns, ocr_fmt = _parse_text(ocr_text)
+
+        if callback:
+            ocr_real = [t for t in ocr_txns if t.description not in ("Starting balance", "Ending balance")]
+            callback(f"OCR detected format: {ocr_fmt.upper()} — found {len(ocr_real)} transactions")
+
+        # Use OCR results if they're better (or if first attempt was forced OCR)
+        if force_ocr:
+            return ocr_txns
+
+        ocr_real = [t for t in ocr_txns if t.description not in ("Starting balance", "Ending balance")]
+        real_txns = [t for t in txns if t.description not in ("Starting balance", "Ending balance")]
+        if len(ocr_real) > len(real_txns):
+            return ocr_txns
+        return txns  # pdfplumber was actually better
+
+    elif not OCR_AVAILABLE:
+        if callback:
+            callback("Warning: OCR not available — install pytesseract and pdf2image for scanned PDF support")
+
+    # Return whatever we got from attempt 1
+    if force_ocr:
+        txns, text_fmt = _parse_text(all_text)
+    return txns
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +843,151 @@ def _flush_commbank_txn(
         date=date, description=description,
         debit=debit, credit=credit, balance=balance,
     ))
+
+
+# ---------------------------------------------------------------------------
+# Chase format: DATE DESCRIPTION AMOUNT BALANCE (single-line transactions)
+# Amount is signed: positive=credit, negative=debit
+# Some lines have dual dates: "01/05 01/04 Online Payment..."
+# ---------------------------------------------------------------------------
+
+# Matches: MM/DD [MM/DD] DESCRIPTION [-]AMOUNT BALANCE
+# e.g.: 12/24 SSATreas 310 Xxsoc Sec PPD ID: ... 3,670.00 286,131.72
+# e.g.: 01/05 01/04 Online Payment ... -82.50 284,799.22
+CHASE_TXN_PATTERN = re.compile(
+    r"^(\d{2}/\d{2})\s+"               # Primary date (MM/DD)
+    r"(?:(\d{2}/\d{2})\s+)?"           # Optional second date (posting date)
+    r"(.+?)\s+"                         # Description (non-greedy)
+    r"([-]?[\d,]+\.\d{2})\s+"          # Amount (signed)
+    r"([\d,]+\.\d{2})\s*$"             # Balance
+)
+
+
+def extract_chase_transactions(all_text: str) -> list[Transaction]:
+    """Extract transactions from Chase bank statements.
+
+    Chase uses: DATE DESCRIPTION AMOUNT BALANCE format.
+    - Positive amount = credit (deposit)
+    - Negative amount = debit (withdrawal)
+    - Balance is running balance
+    """
+    transactions = []
+
+    # Extract statement period year
+    # "December 24, 2025 through January 27, 2026"
+    period_match = re.search(
+        r"(\w+)\s+\d{1,2},?\s*(\d{4})\s+through\s+(\w+)\s+\d{1,2},?\s*(\d{4})",
+        all_text, re.IGNORECASE
+    )
+    start_year = period_match.group(2) if period_match else "2025"
+    end_year = period_match.group(4) if period_match else start_year
+    start_month_name = period_match.group(1) if period_match else "January"
+    end_month_name = period_match.group(3) if period_match else "December"
+
+    start_month_num = int(MONTH_FULL.get(start_month_name.capitalize(), "01"))
+
+    def get_year_for_month(month_num: int) -> str:
+        """Determine year for cross-year statements."""
+        if int(start_year) != int(end_year):
+            if month_num >= start_month_num:
+                return start_year
+            return end_year
+        return start_year
+
+    # Extract beginning balance
+    begin_match = re.search(
+        r"[Bb]eginning\s+[Bb]alance\s+\$?([\d,]+\.\d{2})", all_text
+    )
+    if begin_match:
+        transactions.append(Transaction(
+            date="", description="Starting balance",
+            debit="", credit="",
+            balance=parse_amount_generic(begin_match.group(1)),
+        ))
+
+    # Extract ending balance for later
+    end_match = re.search(
+        r"[Ee]nding\s+[Bb]alance\s+\$?([\d,]+\.\d{2})", all_text
+    )
+
+    in_transactions = False
+    lines = all_text.split("\n")
+
+    for line in lines:
+        line_stripped = line.strip()
+        lower = line_stripped.lower()
+
+        # Detect transaction section
+        if "transaction detail" in lower:
+            in_transactions = True
+            continue
+        if "ending balance" in lower:
+            in_transactions = False
+            continue
+        if "in case of errors" in lower:
+            in_transactions = False
+            continue
+
+        if not in_transactions:
+            continue
+
+        # Skip headers and non-data lines
+        if lower.startswith("date") and "description" in lower:
+            continue
+        if lower.startswith("beginning balance"):
+            continue
+        if not line_stripped:
+            continue
+
+        # Try to match Chase transaction pattern
+        txn_match = CHASE_TXN_PATTERN.match(line_stripped)
+        if txn_match:
+            date_raw = txn_match.group(1)  # MM/DD
+            # second_date = txn_match.group(2)  # optional MM/DD (not used)
+            description = txn_match.group(3).strip()
+            amount_raw = txn_match.group(4)
+            balance_raw = txn_match.group(5)
+
+            # Parse date with year hint
+            parts = date_raw.split("/")
+            if len(parts) == 2:
+                month_num = int(parts[0])
+                year = get_year_for_month(month_num)
+                date = f"{year}-{parts[0].zfill(2)}-{parts[1].zfill(2)}"
+            else:
+                continue
+
+            amount = parse_amount_generic(amount_raw)
+            balance = parse_amount_generic(balance_raw)
+            is_neg = amount_raw.strip().startswith("-")
+
+            if not amount:
+                continue
+
+            # Clean description: remove OCR noise at the end
+            description = re.sub(r"\s+[\\|/()]{1,3}\s*$", "", description).strip()
+            description = " ".join(description.split())
+
+            if is_neg:
+                transactions.append(Transaction(
+                    date=date, description=description,
+                    debit=amount, credit="", balance=balance,
+                ))
+            else:
+                transactions.append(Transaction(
+                    date=date, description=description,
+                    debit="", credit=amount, balance=balance,
+                ))
+
+    # Add ending balance
+    if end_match:
+        transactions.append(Transaction(
+            date="", description="Ending balance",
+            debit="", credit="",
+            balance=parse_amount_generic(end_match.group(1)),
+        ))
+
+    return transactions
 
 
 # ---------------------------------------------------------------------------

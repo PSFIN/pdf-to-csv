@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 
 from pdf_processor import (
+    OCR_AVAILABLE,
     calculate_summary,
     detect_format,
     extract_page_transactions,
@@ -71,6 +72,8 @@ async def process_pdf_job(job_id: str):
         await asyncio.sleep(0)
         fmt = detect_format(pdf)
         await q.put(step_event(f"Detected format: {'table-based' if fmt == 'table' else 'text-based'} statement"))
+        if OCR_AVAILABLE:
+            await q.put(step_event("OCR support: available (scanned documents supported)"))
         await asyncio.sleep(0)
 
         all_transactions = []
@@ -99,8 +102,20 @@ async def process_pdf_job(job_id: str):
         else:
             await q.put(step_event("Extracting transactions from text content..."))
             await asyncio.sleep(0)
-            all_transactions = extract_text_transactions(pdf)
-            await q.put(step_event(f"Found {len(all_transactions)} entries from text parsing"))
+
+            # Create a callback that sends progress to the SSE queue
+            def ocr_callback(message):
+                # Use a thread-safe way to put into asyncio queue
+                asyncio.get_event_loop().call_soon_threadsafe(
+                    q.put_nowait, step_event(message)
+                )
+
+            all_transactions = extract_text_transactions(
+                pdf,
+                pdf_path=str(job.pdf_path),
+                callback=ocr_callback,
+            )
+            await q.put(step_event(f"Found {len(all_transactions)} entries"))
             await asyncio.sleep(0)
 
         pdf.close()

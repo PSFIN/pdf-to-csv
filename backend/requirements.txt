@@ -3,3 +3,6 @@ uvicorn[standard]>=0.34.0
 pdfplumber>=0.11.0
 python-multipart>=0.0.20
 sse-starlette>=2.2.0
+pytesseract>=0.3.10
+pdf2image>=1.16.0
+Pillow>=10.0.0
