@@ -104,11 +104,13 @@ async def process_pdf_job(job_id: str):
             await asyncio.sleep(0)
 
             # Create a callback that sends progress to the SSE queue
+            loop = asyncio.get_running_loop()
+
             def ocr_callback(message):
-                # Use a thread-safe way to put into asyncio queue
-                asyncio.get_event_loop().call_soon_threadsafe(
-                    q.put_nowait, step_event(message)
-                )
+                try:
+                    loop.call_soon_threadsafe(q.put_nowait, step_event(message))
+                except Exception:
+                    pass  # Don't crash OCR if queue is full
 
             all_transactions = extract_text_transactions(
                 pdf,
